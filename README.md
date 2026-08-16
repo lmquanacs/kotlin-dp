@@ -22,6 +22,8 @@ application context.
   one-line Kotlin verdict per pattern.
 - **[Kotlin feature map](docs/KOTLIN_FEATURES.md)** — every language feature used here, what it's
   for, and which folder demonstrates it.
+- **[MCP client example](examples/mcp-client-example.md)** — a worked design walkthrough applying
+  the catalogue to one realistic system, including which patterns to leave out.
 
 | Group | Patterns |
 |---|---|
