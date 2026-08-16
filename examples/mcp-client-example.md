@@ -3,10 +3,14 @@
 A design walkthrough for building a **Model Context Protocol client** in Kotlin, used here as a
 realistic end-to-end example of the patterns in this repository.
 
-MCP is a good example precisely because it is not a toy: it is a **bidirectional JSON-RPC peer with
-a negotiated lifecycle, a pluggable transport, cursor-paginated collections, push notifications, two
-distinct error channels, and a service-name resolution step**. Almost every pattern in the catalogue
-earns its place somewhere in it — and a few conspicuously do not.
+MCP is a good example precisely because it is not a toy: a full client is a **bidirectional JSON-RPC
+peer with a negotiated lifecycle, a pluggable transport, cursor-paginated collections, push
+notifications, two distinct error channels, and a service-name resolution step**. Almost every
+pattern in the catalogue earns its place somewhere in it — and a few conspicuously do not.
+
+It is also a good example of how much two constraints can delete. A **stateless** client pinned to
+the **latest protocol revision** drops roughly half the machinery below and five of the patterns.
+**§2** covers that reduction and is worth reading before the rest.
 
 > **Status:** this is a design document. The Kotlin below is illustrative — it is written to be
 > read, not compiled, and is not covered by this repo's test suite. Treat the shapes as the
@@ -15,19 +19,25 @@ earns its place somewhere in it — and a few conspicuously do not.
 > **Spec caveat:** MCP's transport and authorization details have changed across spec revisions
 > (HTTP+SSE was superseded by Streamable HTTP; the auth story has moved more than once). The
 > *architecture* here is stable across those changes, but check the current spec revision before
-> committing to wire-level details.
+> committing to wire-level details — particularly the protocol-version header name and the exact
+> version string, which §2.2 pins to a constant.
 
 ---
 
 ## 1. The shape of the problem
 
-The single most common mistake is building a one-way request/response client. **An MCP client is a
-peer, not a client.** The server can send *you* requests — `sampling/createMessage`, `roots/list`,
-`elicitation/create` — so message routing must be symmetric from day one. Retrofitting that later
-means rewriting the dispatcher.
+In a **session-based** client, the most common mistake is building a one-way request/response client.
+There, an MCP client is a *peer*, not a client: the server can send *you* requests —
+`sampling/createMessage`, `roots/list`, `elicitation/create` — so message routing must be symmetric
+from day one, and retrofitting that later means rewriting the dispatcher.
 
-The connect path has four distinct stages, and conflating the middle two is the second most common
-mistake:
+In a **stateless** client that constraint disappears entirely, along with about half of this
+document. Statelessness and protocol-version support are the first two decisions, not details — see
+**§2**. The rest of §§3–12 describe the full session-based, version-negotiating design; §2 gives the
+reduction and points at what still applies.
+
+The connect path has four distinct stages, and conflating the middle two is a mistake in both
+models:
 
 ```
 ServiceName ──resolve()──► Set<Endpoint> ──select()──► Endpoint ──► Transport ──► Session
@@ -39,7 +49,209 @@ different failure modes and different caching rules.
 
 ---
 
-## 2. Layering
+## 2. Constraints that shape this design
+
+Two constraints do more to determine the pattern set than anything about the domain. Decide both
+before writing code.
+
+### 2.1 Stateless vs session-based
+
+A **session-based** client holds a live connection: a stdio subprocess, or Streamable HTTP with an
+`Mcp-Session-Id` and a server→client stream. It initializes once, keeps state, and receives pushes.
+
+A **stateless** client sends one self-contained HTTP request per call. No session ID, no persistent
+stream, no sticky routing. Each request can land on a different replica. This is the model that fits
+serverless functions, plain load balancers, and short-lived CLI invocations.
+
+**This is not a small variation.** It removes whole capabilities from the protocol surface and
+deletes most of the machinery below.
+
+#### What changes
+
+| Concern | Session-based | Stateless |
+|---|---|---|
+| Transport | stdio, Streamable HTTP + session | **HTTP POST per call only** — stdio is impossible |
+| `initialize` handshake | once per connection | per request, or skipped by agreement |
+| Correlation map (`id`→`Deferred`) | required | **not needed** — the HTTP response *is* the correlation |
+| Server→client requests (sampling, roots, elicitation) | supported | **unavailable** |
+| Notifications (`list_changed`, `progress`, logging) | pushed | **unavailable** — poll or expire |
+| `resources/subscribe` | supported | **unavailable** |
+| Cancellation | `notifications/cancelled` | abort the HTTP request |
+| Session state machine | 7 states | **2** — `Configured` / `Failed` |
+| Load balancing | needs sticky sessions | **any endpoint, per request** ← the win |
+| Re-resolution | on reconnect | per request, and it's cheap ← the win |
+| Cache invalidation | push-driven (`list_changed`) | **TTL only** ← the main regression |
+| Reconnect logic | required | none exists |
+
+#### What you gain
+
+Horizontal scaling with no session affinity, trivial failover (a dead replica costs one retry, not a
+reconnect), serverless deployment, and materially less code — no `Peer`, no pending-request registry,
+no reconnect state machine, no lifecycle to leak.
+
+#### What you give up
+
+**Sampling and elicitation are gone.** A server cannot ask your model to complete something, and
+cannot ask the user a question mid-tool-call. If a server's tools depend on either, a stateless
+client cannot drive them — this is a compatibility constraint to check per server, not something to
+engineer around.
+
+**Push invalidation is gone**, so a changed tool list reaches you only when your TTL expires. Pick
+that TTL deliberately: it is now your staleness bound, and the only one you have.
+
+**Long-running tools fit badly.** With no progress notifications and an HTTP timeout as your only
+limit, anything slow needs the server to expose a job-handle pattern (`start` → `poll`) at the tool
+level.
+
+#### The reduced architecture
+
+```
+ServiceName ──resolve()──► Endpoint ──HTTP POST──► JsonRpcResponse
+```
+
+```
+┌──────────────────────────────────────────────┐
+│  Host / agent loop                            │
+├──────────────────────────────────────────────┤
+│  StatelessMcpClient   ← Facade                │
+│    callTool · listTools (TTL-cached)          │
+├──────────────────────────────────────────────┤
+│  Resolver + selector  ← Strategy chain + cache│
+├──────────────────────────────────────────────┤
+│  HTTP client          ← keep-alive, auth, retry│
+└──────────────────────────────────────────────┘
+```
+
+Three layers instead of six. `Session` and `Peer` disappear:
+
+```kotlin
+class StatelessMcpClient(
+    private val resolver: Resolver,
+    private val selector: EndpointSelector,
+    private val http: HttpTransport,
+    private val toolCache: CacheAside<ServiceName, List<Tool>>,
+    private val retry: RetryPolicy,
+) {
+    suspend fun callTool(
+        service: ServiceName,
+        tool: ToolName,
+        args: JsonObject,
+    ): ToolCallOutcome {
+        val server = resolver.resolve(service) as? ResolvedServer.Http
+            ?: return ToolCallOutcome.Failed.NotConnected
+
+        // Re-resolved and re-selected per request: failover is free, no sticky session needed.
+        val endpoint = selector.select(server.endpoints)
+
+        // One request, one response. No pending map, no id bookkeeping beyond JSON-RPC's requirement.
+        val response = http.post(endpoint, server.auth, rpc("tools/call", callParams(tool, args)))
+        return response.toToolOutcome()
+    }
+
+    /** TTL-cached: there is no `list_changed` to invalidate on. */
+    suspend fun listTools(service: ServiceName): List<Tool> = toolCache.get(service).orEmpty()
+}
+```
+
+#### What still applies from the rest of this document
+
+| Section | Status under stateless |
+|---|---|
+| §5 Core types | **Applies** — minus `ResolvedServer.Stdio` |
+| §8 Two error channels | **Applies unchanged** — this is orthogonal to transport |
+| §9 Service name resolution | **Applies, and matters more** — now on the hot path of every call |
+| §10 Pagination | **Applies** — the cursor travels in the request, so it needs no session |
+| §11 Multi-server aggregation | **Applies unchanged** |
+| §12 Testing | **Applies, and gets easier** — a fake HTTP responder replaces the in-process transport |
+| §6 Session state | **Mostly deleted** — two states, no capability gate unless you re-`initialize` |
+| §7 The peer | **Deleted** — no correlation map, no inbound dispatch |
+| §10 Notifications | **Deleted** — nothing pushes |
+
+#### Two things to get right
+
+**Resolution is now per-request, so its cache is load-bearing.** Every `callTool` hits the resolver.
+Without single-flight and a sane TTL you have turned one tool call into one DNS lookup —
+see [cache-aside](../src/main/kotlin/com/example/kotlindp/patterns/production/cacheaside/).
+
+**Retry is safe for reads and dangerous for writes.** Stateless requests look trivially retryable,
+which is the trap: `tools/list` is idempotent, but `tools/call` generally is not. Retrying a tool
+that charges a card or sends a message duplicates the effect. Classify per method, and require an
+idempotency key before retrying a call —
+see [retry](../src/main/kotlin/com/example/kotlindp/patterns/production/retry/).
+
+### 2.2 Pinned to the latest protocol revision
+
+Supporting exactly one protocol revision — the latest — removes the other half of the compatibility
+machinery.
+
+Normally `initialize` is a *negotiation*: the client proposes a version, the server may answer with
+an older one it supports, and the client decides whether to proceed. Supporting many revisions then
+pulls in a per-version codec ([Strategy](../src/main/kotlin/com/example/kotlindp/patterns/behavioral/strategy/))
+or a compatibility shim ([Adapter](../src/main/kotlin/com/example/kotlindp/patterns/structural/adapter/)),
+plus a supported-versions set and a matrix of what works where.
+
+Pinned to latest, all of that becomes a constant and a comparison:
+
+```kotlin
+/** The only revision this client speaks. Not a negotiated field — a fact about the build. */
+const val PROTOCOL_VERSION: String = "<latest-revision>"
+
+sealed interface ConnectFailure {
+    data class UnsupportedProtocolVersion(
+        val serverOffered: String,
+        val weRequire: String = PROTOCOL_VERSION,
+    ) : ConnectFailure
+    // ...
+}
+```
+
+**Fail fast and loudly.** A version mismatch is a compatibility fact, not a degraded mode — there is
+nothing to fall back to. Detect it when a server is registered or configured, not on the first tool
+call in production.
+
+**The trade is explicit:** you cannot talk to servers on older revisions at all. That is usually the
+right call for an internal fleet you control, and the wrong one for a client that consumes
+third-party servers you don't.
+
+Three consequences specific to this combination:
+
+**Only one transport is in scope.** The older HTTP+SSE transport belongs to superseded revisions, so
+pinning to latest means Streamable HTTP and nothing else — reinforcing the point in §14 that the
+Bridge no longer has two implementations to bridge.
+
+**In stateless mode the version travels on every request.** There is no session to carry it, so the
+`MCP-Protocol-Version` header goes on each POST rather than being established once at handshake.
+(Confirm the exact header name against the current spec — see the caveat at the top.)
+
+**Protocol version is not the same thing as server capabilities, and conflating them is the trap.**
+Pinning the revision fixes the *grammar*; it says nothing about whether a given server offers tools,
+resources, or prompts. Capability checking stays. And if you also skip `initialize` — which stateless
+clients often do — you have no capabilities object at all, so discovery degenerates to calling the
+method and handling JSON-RPC `-32601 Method not found`. Model that as a first-class outcome rather
+than an unexpected error:
+
+```kotlin
+sealed interface Failed : ToolCallOutcome {
+    /** Server does not implement this method on the pinned revision. Expected, not exceptional. */
+    data class MethodUnsupported(val method: String) : Failed
+    // ...
+}
+```
+
+One test is enough to hold this in place: assert the constant equals the version string actually sent
+on the wire, so a bump can't be half-applied.
+
+> **The one fork worth confirming.** "Stateless" is used for two different things. If your servers
+> use Streamable HTTP and may answer a single POST with an *SSE stream*, then within that one
+> request/response the server can still send you requests — so sampling and progress survive, and
+> you need a mini-dispatcher for the duration of the call. If your client is pure JSON
+> request/response, the table above holds exactly. The rest of this section assumes the latter.
+
+---
+
+## 3. Layering
+
+*Session-based model. For the three-layer stateless reduction, see §2.*
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -68,7 +280,7 @@ stack testable without spawning subprocesses or opening sockets.
 
 ---
 
-## 3. Pattern map
+## 4. Pattern map
 
 | Layer | Pattern | Why | Catalogue |
 |---|---|---|---|
@@ -85,13 +297,13 @@ stack testable without spawning subprocesses or opening sockets.
 | Multi-server | **Composite** | N servers → one tool list, plus a collision policy | [composite](../src/main/kotlin/com/example/kotlindp/patterns/structural/composite/) |
 | Resolution | **Strategy + CoR** | Pluggable resolvers tried in precedence order | [strategy](../src/main/kotlin/com/example/kotlindp/patterns/behavioral/strategy/) |
 | Resolution | **Cache-Aside** | Single-flight: 10 connections must not fire 10 DNS lookups | [cacheaside](../src/main/kotlin/com/example/kotlindp/patterns/production/cacheaside/) |
-| Errors | **Sealed result** | Two error channels that mean different things (§7) | [result](../src/main/kotlin/com/example/kotlindp/patterns/kotlinidioms/result/) |
+| Errors | **Sealed result** | Two error channels that mean different things (§8) | [result](../src/main/kotlin/com/example/kotlindp/patterns/kotlinidioms/result/) |
 | Identity | **Value class** | `ServiceName` vs `Endpoint` vs `ToolName` | [inlinereified](../src/main/kotlin/com/example/kotlindp/patterns/kotlinidioms/inlinereified/) |
 | Resilience | **Retry + Circuit Breaker** | Reconnection, and the resolver is itself fallible | [production/](../src/main/kotlin/com/example/kotlindp/patterns/production/) |
 
 ---
 
-## 4. Core types
+## 5. Core types
 
 Resolution should not yield a URL. It should yield a **transport family**, because stdio servers
 have no address at all:
@@ -127,7 +339,7 @@ accidentally be paired with HTTP auth, because the family members are constructe
 
 ---
 
-## 5. Session state — where sealed classes pay for themselves
+## 6. Session state — where sealed classes pay for themselves
 
 The flag-based version of this has a `var initialized: Boolean` and a
 `var serverCapabilities: ServerCapabilities?`, and every call site has to know that the second is
@@ -175,7 +387,7 @@ machine earns its keep rather than being ceremony.
 
 ---
 
-## 6. The peer: correlation and bidirectional dispatch
+## 7. The peer: correlation and bidirectional dispatch
 
 ```kotlin
 class Peer(
@@ -223,7 +435,7 @@ Three details that are load-bearing:
 
 ---
 
-## 7. Two error channels — do not collapse them
+## 8. Two error channels — do not collapse them
 
 This is the design decision most worth getting right, and it is
 [typed errors](../src/main/kotlin/com/example/kotlindp/patterns/kotlinidioms/result/) in its purest
@@ -256,7 +468,7 @@ sealed interface ToolCallOutcome {
 
 ---
 
-## 8. Service name resolution
+## 9. Service name resolution
 
 Resolvers are a first-match chain — the functional form, so precedence is visible at the call site
 instead of buried in constructor nesting:
@@ -317,7 +529,7 @@ bind tokens to the resolved origin rather than the logical name. The same applie
 
 ---
 
-## 9. Pagination and notifications
+## 10. Pagination and notifications
 
 MCP list endpoints are cursor-paginated, which is exactly the
 [lazy iterator](../src/main/kotlin/com/example/kotlindp/patterns/behavioral/iterator/) case — callers
@@ -350,7 +562,7 @@ invalidate on the push rather than on a timer.
 
 ---
 
-## 10. Multi-server aggregation
+## 11. Multi-server aggregation
 
 The host presents many servers to the model as one tool namespace — a
 [composite](../src/main/kotlin/com/example/kotlindp/patterns/structural/composite/) with a collision
@@ -374,7 +586,7 @@ tool list. That choice is a product decision, not a technical one — see
 
 ---
 
-## 11. Testing strategy
+## 12. Testing strategy
 
 The layering exists so that almost nothing needs a real process or socket:
 
@@ -393,22 +605,39 @@ real time will not be tested.**
 
 ---
 
-## 12. Pitfalls checklist
+## 13. Pitfalls checklist
+
+**Both models**
+
+- [ ] `CancellationException` is rethrown, never swallowed
+- [ ] Every outbound request has a timeout
+- [ ] Tool `isError: true` reaches the model; protocol errors do not
+- [ ] Resolved hosts are validated before credentials are sent
+- [ ] Tool names are namespaced across servers
+- [ ] One failing server doesn't blank the aggregate tool list
+- [ ] Protocol version mismatch fails loudly, at registration rather than first call
+- [ ] The pinned version constant is asserted against what goes on the wire
+- [ ] Capability checks still happen — pinning the revision is not a capability guarantee
+- [ ] `-32601 Method not found` is a modelled outcome, not an unexpected exception
+
+**Session-based only**
 
 - [ ] Message routing is symmetric — the server can send *you* requests
 - [ ] `pending.remove(id)` happens in `finally`
 - [ ] Timeouts send `notifications/cancelled`, not just local cancellation
-- [ ] `CancellationException` is rethrown, never swallowed
-- [ ] Every outbound request has a timeout
-- [ ] Tool `isError: true` reaches the model; protocol errors do not
 - [ ] Re-resolution happens on reconnect, not only first connect
-- [ ] Resolved hosts are validated before credentials are sent
-- [ ] Tool names are namespaced across servers
-- [ ] One failing server doesn't blank the aggregate tool list
 - [ ] Cached lists are invalidated by `list_changed`, not by a timer alone
-- [ ] Protocol version mismatch fails loudly at handshake
 
-## 13. Patterns to leave out
+**Stateless only**
+
+- [ ] Resolution is cached with single-flight — every call goes through it
+- [ ] `tools/call` is **not** retried blindly; only with an idempotency key
+- [ ] The tool-list TTL is a deliberate staleness bound, not a default
+- [ ] Servers requiring sampling or elicitation are detected and rejected at config time
+- [ ] HTTP keep-alive is on, or you pay a TLS handshake per tool call
+- [ ] Auth token refresh is handled per request, not per session
+
+## 14. Patterns to leave out
 
 Included here because recognising an unnecessary pattern is worth as much as applying a necessary
 one:
@@ -425,3 +654,21 @@ one:
   you own the hierarchy. See [visitor](../src/main/kotlin/com/example/kotlindp/patterns/behavioral/visitor/).
 - **Mediator** — tempting for the host layer, but a `SystemMediator` coordinating every client and
   the model is a god object. Keep coordination in the agent loop.
+
+### Additionally, under the stateless + latest-only constraints
+
+- **State** — the session state machine collapses to `Configured` / `Failed`. Two states is an
+  `enum`, not a sealed hierarchy. This is the pattern's own advice applied against itself: sealed
+  states earn their place when states *carry different data*, and here they no longer do.
+- **Observer** — nothing pushes, so there is no subject. Connection state is not a `StateFlow`
+  because there is no connection.
+- **Bridge** — with stdio impossible, one transport remains. Keep the interface only if you want an
+  in-memory fake for tests; that is a testability argument, not a Bridge.
+- **Correlation Identifier** — the HTTP response *is* the correlation.
+- **Strategy / Adapter for protocol versions** — pinning to the latest revision replaces the
+  per-version codec and the compatibility shim with a `const val` and one equality check (§2.2).
+
+That is five patterns deleted by two deployment constraints rather than by any design decision, which
+is the most useful thing this example demonstrates: **the right pattern set is a function of the
+constraints, not of the domain.** The same client, run session-based against a mixed-revision fleet,
+needs every one of them back.
